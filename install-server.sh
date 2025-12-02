@@ -1,9 +1,11 @@
 #!/bin/bash
 
 # ==========================================
-# AUTO INSTALL SCRIPT V6 (Final Fix)
+# AUTO INSTALL SCRIPT V3.5 (MODIFIED)
+# Fitur: V3 Folder Structure + Logging + Custom DB + Smart Detect
 # ==========================================
 
+# 1. SETUP LOGGING (Fitur Baru)
 LOG_DIR="/var/log/chikami"
 LOG_FILE="$LOG_DIR/hasil.log"
 
@@ -12,6 +14,7 @@ if [ ! -d "$LOG_DIR" ]; then
     chmod 700 "$LOG_DIR"
 fi
 
+# Fungsi untuk catat log ke layar & file
 log_activity() {
     local message="$1"
     local timestamp=$(date "+%Y-%m-%d %H:%M:%S")
@@ -19,30 +22,44 @@ log_activity() {
 }
 
 echo "=================================================" >> "$LOG_FILE"
-log_activity "MULAI SCRIPT INSTALASI V6"
+log_activity "MULAI SCRIPT INSTALASI V3.5"
 
-# 1. CEK ROOT
+# 2. CEK ROOT USER
 if [[ $EUID -ne 0 ]]; then
-   echo "Error: Jalankan sebagai root (sudo)." 
+   echo "Error: Script ini harus dijalankan sebagai root (sudo)." 
    exit 1
 fi
 
-# 2. CEK RAM & SWAP
-log_activity "Cek Hardware..."
+# ---------------------------------------------
+# 3. CEK RAM & SWAP
+# ---------------------------------------------
+log_activity "Memeriksa Spesifikasi Server..."
+
 TOTAL_RAM=$(free -m | awk '/^Mem:/{print $2}')
 TOTAL_SWAP=$(free -m | awk '/^Swap:/{print $2}')
 
-if [[ $TOTAL_RAM -lt 1000 && $TOTAL_SWAP -eq 0 ]]; then
-    read -p "RAM < 1GB. Buat SWAP 2GB? (y/n): " create_swap
-    if [[ "$create_swap" == "y" ]]; then
-        fallocate -l 2G /swapfile
-        chmod 600 /swapfile
-        mkswap /swapfile
-        swapon /swapfile
-        if ! grep -q "/swapfile" /etc/fstab; then
-            echo '/swapfile none swap sw 0 0' >> /etc/fstab
+echo "RAM: ${TOTAL_RAM}MB | SWAP: ${TOTAL_SWAP}MB"
+
+if [[ $TOTAL_RAM -lt 1000 ]]; then
+    if [[ $TOTAL_SWAP -eq 0 ]]; then
+        log_activity "WARNING: RAM < 1GB & No Swap."
+        read -p "Buat SWAP 2GB? (y/n): " create_swap_choice
+        
+        if [[ "$create_swap_choice" == "y" || "$create_swap_choice" == "Y" ]]; then
+            log_activity "Membuat Swap 2GB..."
+            fallocate -l 2G /swapfile
+            chmod 600 /swapfile
+            mkswap /swapfile
+            swapon /swapfile
+            if ! grep -q "/swapfile" /etc/fstab; then
+                echo '/swapfile none swap sw 0 0' >> /etc/fstab
+            fi
+            log_activity "Swap 2GB berhasil dibuat."
+        else
+            log_activity "User menolak pembuatan Swap."
         fi
-        log_activity "Swap 2GB dibuat."
+    else
+        log_activity "Swap sudah tersedia. Aman."
     fi
 fi
 
@@ -51,26 +68,24 @@ log_activity "Update Repository..."
 apt update -y > /dev/null 2>&1
 
 # ---------------------------------------------
-# 3. HANDLER KONFLIK WEB SERVER
+# 4. PILIH WEB SERVER (Dengan Deteksi)
 # ---------------------------------------------
 echo ""
 echo "=== PILIH WEB SERVER ==="
-echo "1. Nginx"
+echo "1. Nginx (Otomatis Config PHP)"
 echo "2. Apache2"
-read -p "Pilihan: " webserver_choice
+echo "0. Batal"
+read -p "Masukkan pilihan [0-2]: " webserver_choice
 
 IS_NGINX=0
 
 case $webserver_choice in
     1)
-        # Stop Apache jika jalan
-        if systemctl is-active --quiet apache2; then
-            systemctl stop apache2
-            systemctl disable apache2
-        fi
-        
-        # Install Nginx
-        if ! command -v nginx >/dev/null 2>&1; then
+        # Deteksi Nginx
+        if command -v nginx >/dev/null 2>&1; then
+            log_activity "INFO: Nginx sudah terinstall. Skip install package."
+        else
+            log_activity "Menginstall Nginx..."
             apt install -y nginx
         fi
         systemctl enable nginx
@@ -78,71 +93,72 @@ case $webserver_choice in
         IS_NGINX=1
         ;;
     2)
-        # Stop Nginx jika jalan
-        if systemctl is-active --quiet nginx; then
-            systemctl stop nginx
-            systemctl disable nginx
-        fi
-        
-        # Install Apache
-        if ! command -v apache2 >/dev/null 2>&1; then
+        # Deteksi Apache
+        if command -v apache2 >/dev/null 2>&1; then
+            log_activity "INFO: Apache2 sudah terinstall. Skip install package."
+        else
+            log_activity "Menginstall Apache2..."
             apt install -y apache2
         fi
         systemctl enable apache2
         systemctl start apache2
         ;;
-    *)
-        echo "Batal."
+    0)
+        log_activity "Instalasi dibatalkan user."
         exit 0
+        ;;
+    *)
+        echo "Pilihan tidak valid."
+        exit 1
         ;;
 esac
 
 # ---------------------------------------------
-# 4. DATABASE & PHP
+# 5. INSTALL DEPENDENCIES (Dengan Deteksi)
 # ---------------------------------------------
 echo ""
-log_activity "Cek Database & PHP..."
+log_activity "Cek Dependencies (MySQL & PHP)..."
 
-# Cek DB Konflik
-if ! dpkg -l | grep -q mariadb-server && ! command -v mysql >/dev/null 2>&1; then
+# Cek Database existing (MySQL atau MariaDB)
+if command -v mysql >/dev/null 2>&1; then
+    log_activity "INFO: Database Server (MySQL/MariaDB) sudah terinstall."
+else
+    log_activity "Menginstall MySQL Server..."
     apt install -y mysql-server unzip wget
 fi
 
 # Install PHP
+log_activity "Memastikan PHP terinstall..."
 apt install -y php php-fpm php-mysql php-curl php-gd php-mbstring php-xml php-zip php-json libapache2-mod-php > /dev/null 2>&1
 
-# --- PERBAIKAN LOGIC NGINX DI SINI ---
+# ---------------------------------------------
+# 6. KONFIGURASI NGINX OTOMATIS
+# ---------------------------------------------
 if [[ $IS_NGINX -eq 1 ]]; then
+    echo ""
+    log_activity "Konfigurasi Nginx..."
+    
     PHP_VERSION=$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')
     FPM_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
     
-    log_activity "Mengkonfigurasi Nginx untuk PHP $PHP_VERSION..."
-    
-    # 1. Backup file default bawaan jika belum ada backup
-    if [ ! -f /etc/nginx/sites-available/default.bak ]; then
-        mv /etc/nginx/sites-available/default /etc/nginx/sites-available/default.bak
-        log_activity "File default Nginx asli dibackup ke default.bak"
-    fi
+    log_activity "PHP Versi: $PHP_VERSION | Socket: $FPM_SOCKET"
 
-    # 2. Tulis Ulang Config (Force Overwrite)
+    # Overwrite default config (PENTING: Agar PHP jalan)
+    # Kita overwrite saja agar pasti jalan, karena V3 aslinya juga overwrite.
     cat > /etc/nginx/sites-available/default <<EOF
 server {
     listen 80 default_server;
     listen [::]:80 default_server;
-    
-    # Root folder
+
     root /var/www/html;
-    
-    # Index file (PENTING: index.php harus ada)
-    index index.php index.html index.htm;
-    
+    index index.php index.html index.htm index.nginx-debian.html;
+
     server_name _;
-    
+
     location / {
         try_files \$uri \$uri/ =404;
     }
-    
-    # Config PHP agar dibaca
+
     location ~ \.php$ {
         include snippets/fastcgi-php.conf;
         fastcgi_pass unix:$FPM_SOCKET;
@@ -153,73 +169,96 @@ server {
     }
 }
 EOF
-    # 3. Restart Nginx
     systemctl restart nginx
-    log_activity "Config Nginx diperbarui (PHP Socket: $FPM_SOCKET)"
+    log_activity "Config Nginx diperbarui."
 fi
 
 # ---------------------------------------------
-# 5. INPUT DATABASE
+# 7. SETUP DATABASE (INPUT MANUAL + LOG)
 # ---------------------------------------------
 echo ""
-echo "--- KONFIGURASI DATABASE ---"
+echo "--- SETUP DATABASE WORDPRESS ---"
+echo "Silakan masukkan detail database baru:"
+
 read -p "Nama Database : " DB_NAME
 read -p "Username DB   : " DB_USER
 read -s -p "Password DB   : " DB_PASS
-echo ""
+echo "" # Enter baris baru
 
-if [[ -n "$DB_NAME" && -n "$DB_USER" ]]; then
+if [[ -z "$DB_NAME" || -z "$DB_USER" || -z "$DB_PASS" ]]; then
+    log_activity "ERROR: Input database kosong. Setup DB dilewati."
+else
+    log_activity "Membuat Database: $DB_NAME | User: $DB_USER"
+    
+    # Eksekusi Query
     mysql -e "CREATE DATABASE IF NOT EXISTS \`${DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;"
     mysql -e "CREATE USER IF NOT EXISTS '${DB_USER}'@'localhost' IDENTIFIED BY '${DB_PASS}';"
     mysql -e "GRANT ALL PRIVILEGES ON \`${DB_NAME}\`.* TO '${DB_USER}'@'localhost';"
     mysql -e "FLUSH PRIVILEGES;"
-    log_activity "Database $DB_NAME berhasil dibuat."
+    
+    # --- LOG CREDENTIALS KE FILE (SESUAI REQUEST) ---
+    echo "-------------------------------------------------" >> "$LOG_FILE"
+    echo "DATABASE CREDENTIALS (SAVED)" >> "$LOG_FILE"
+    echo "DB Name : $DB_NAME" >> "$LOG_FILE"
+    echo "DB User : $DB_USER" >> "$LOG_FILE"
+    echo "DB Pass : $DB_PASS" >> "$LOG_FILE"
+    echo "-------------------------------------------------" >> "$LOG_FILE"
+    
+    log_activity "Database berhasil disetup."
 fi
 
 # ---------------------------------------------
-# 6. DOWNLOAD APPS & FIX FOLDER
+# 8. DOWNLOAD & INSTALL APPS
 # ---------------------------------------------
 echo ""
-echo "=== PILIH APLIKASI (Pisahkan koma, 1,2) ==="
+echo "=== PILIH APLIKASI (Pisahkan koma, misal: 1,2) ==="
 echo "1. phpMyAdmin"
 echo "2. WordPress"
-read -p "Pilihan: " app_choices
+read -p "Masukkan pilihan: " app_choices
 
 cd /var/www/html || exit
 
-# Clean Install (Hapus index.html bawaan nginx/apache biar gak ganggu)
-rm -f index.html index.nginx-debian.html
-
+# -- Install phpMyAdmin --
 if [[ "$app_choices" == *"1"* ]]; then
-    if [ ! -d "phpmyadmin" ]; then
+    if [ -d "phpmyadmin" ]; then 
+        log_activity "Folder phpmyadmin sudah ada, skip download."
+    else
+        log_activity "Download phpMyAdmin..."
         wget -q https://files.phpmyadmin.net/phpMyAdmin/5.2.3/phpMyAdmin-5.2.3-all-languages.zip -O phpmyadmin.zip
         unzip -q phpmyadmin.zip
         mv phpMyAdmin-5.2.3-all-languages phpmyadmin
         rm phpmyadmin.zip
-        log_activity "phpMyAdmin terinstall."
+        log_activity "phpMyAdmin selesai."
     fi
 fi
 
+# -- Install WordPress --
 if [[ "$app_choices" == *"2"* ]]; then
-    log_activity "Menginstall WordPress..."
-    # Download
-    wget -q https://id.wordpress.org/latest-id_ID.zip -O wordpress.zip
-    unzip -q wordpress.zip
-    rm wordpress.zip
-    
-    # --- FIX FOLDER NESTING (Script memindahkan isi folder wordpress ke luar) ---
     if [ -d "wordpress" ]; then
-        log_activity "Memindahkan file WordPress ke root directory..."
-        cp -r wordpress/* .
-        rm -rf wordpress
+        log_activity "Folder wordpress sudah ada, skip download."
+    else
+        log_activity "Download WordPress..."
+        wget -q https://id.wordpress.org/latest-id_ID.zip -O wordpress.zip
+        unzip -q wordpress.zip
+        rm wordpress.zip
+        
+        # NOTE: Sesuai request V3, folder 'wordpress' TIDAK DIPINDAH ke root.
+        # Struktur tetap: /var/www/html/wordpress
+        log_activity "WordPress selesai (Lokasi: /var/www/html/wordpress)."
     fi
-    log_activity "WordPress siap di /var/www/html."
 fi
 
-# Permissions
+# ---------------------------------------------
+# 9. FINISHING
+# ---------------------------------------------
+echo ""
+log_activity "Mengatur Permissions..."
 chown -R www-data:www-data /var/www/html
 chmod -R 755 /var/www/html
 
 echo ""
-log_activity "SELESAI. Silakan akses via Browser."
-
+log_activity "INSTALASI SELESAI."
+echo "Cek Log Lengkap di: $LOG_FILE"
+if [[ -f /swapfile ]]; then
+    echo "Status Swap: AKTIF (2GB)"
+fi
